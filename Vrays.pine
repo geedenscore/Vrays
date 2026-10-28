@@ -1,0 +1,644 @@
+ //@version=6
+// Vrays — multi-timeframe imbalance distal edges (the Vequilibrium method)
+//
+// Marks the FAR edge of an imbalance on every higher timeframe: candle 1's high on
+// a bullish displacement, candle 1's low on a bearish one — candle 1 being the
+// candle that just closed. It does not wait for the 3-candle pattern to complete;
+// the moment the forming candle trades beyond candle 1's extreme the imbalance is
+// being created and that extreme tick is the distal edge. Arms on displacement,
+// dies the moment price is back on the wrong side of it. Both halves run on traded
+// price, not closes, so the levels are identical on every chart timeframe -- unless
+// "Sweep on chart-TF touch" is on, which trades that guarantee for killing levels
+// the instant the chart you are on touches them.
+//
+// Each level can also carry a SHADE: the band between price and the level, filling the
+// empty space to the right of the live candle for exactly as many bars as that level's
+// own line runs. Per-timeframe on/off in its own group, so you can draw every ray and
+// shade only the handful you are trading off.
+//
+// Split out of Vexcision, which carried this and the Fair Value Gap module in one
+// script. Each half asks its own timeframes for data and the pair of them together
+// ran the script out of memory, so they are separate indicators now. The other
+// half is VfvgX. Add both if you want both.
+
+indicator("Vrays", "Vrays", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ─── Contact ──────────────────────────────────────────────────────────────────
+gC = "Contact"
+tolPts = input.float(1, "Contact tolerance (points)", minval = 0, step = 0.25, group = gC, tooltip = "Price coming within this many points of a level counts as reaching it — the level is swept, same as a clean touch. It also raises the bar for displacement: a move only counts as leaving the level behind once it clears the band, so a level can never appear already inside its own contact zone. 0 = exact touches only (MNQ: 1 point = 4 ticks).", display = display.none)
+tfKill = input.bool(false, "Sweep on chart-TF touch", group = gC, tooltip = "Off: while the higher-timeframe candle that armed a level is still forming, the level only dies when the CHART CLOSES back inside it — on a 15m chart that means waiting for the 15m close. On: the first chart-timeframe WICK back into it sweeps it, so the 15m level dies the moment a 1m bar touches it with the 15m candle still open. The reasoning: for the 15m gap to survive, the 15m candle's own low has to stay above the level, so a 1m touch has already closed it. The bar that armed the level is exempt either way — it straddles the level by construction. Trade-off: a lower chart timeframe can see the intrabar sequence and will kill levels a higher chart cannot yet rule out, so with this on the levels are no longer identical on every chart timeframe. These kills also raise the fill alert, where the close-based disarm does not.", display = display.none)
+
+// ─── Display ──────────────────────────────────────────────────────────────────
+gD = "Vequilibrium · Display"
+hideLower = input.bool(true, "Hide timeframes below chart TF", group = gD, tooltip = "On a 15m chart, skip the 5m / 10m levels.", display = display.none)
+showLbls  = input.bool(true, "Show timeframe labels",          group = gD, display = display.none)
+lblMode   = input.string("Match line", "Label colour", options = ["Match line", "Custom"], group = gD, display = display.none)
+lblCustom = input.color (#d1d4dc, "Custom label colour", group = gD, display = display.none)
+lblOffset = input.int (4, "Offset right (bars)", minval = 0, maxval = 50, group = gD, tooltip = "Minimum distance past the live candle. With the staircase on this is what the LOWEST active timeframe gets; everything above it steps further right.", display = display.none)
+stairOn   = input.bool(true, "Staircase by timeframe", group = gD, inline = "stair", display = display.none)
+stairStep = input.int (2, "", minval = 1, maxval = 20, group = gD, inline = "stair", tooltip = "Fans the levels out instead of stacking them at one x. The lowest ACTIVE timeframe sits at 'Offset right', the next active one steps this many bars further right, and so on. Only enabled (and un-hidden) timeframes take a step, so the ladder tightens up as you switch timeframes off.", display = display.none)
+lblSize   = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = gD, display = display.none)
+lnWidth   = input.int (1, "Line width", minval = 1, maxval = 4, group = gD, display = display.none)
+lineSpan  = input.string("Right of price", "Line placement", options = ["Right of price", "From source candle"], group = gD, tooltip = "Right of price: the line sits in the empty space between the live candle and its label. From source candle: it runs back over the candles to the high/low that created it.", display = display.none)
+extLeft   = input.bool(false, "Extend lines left", group = gD, tooltip = "Adds a ray running from the line's left end to the edge of the chart. Combines with either placement.", display = display.none)
+
+lblSz = lblSize == "Tiny" ? size.tiny : lblSize == "Normal" ? size.normal : lblSize == "Large" ? size.large : size.small
+
+// bar_index coordinates only reach ~500 bars back, and a 1W source candle sits much
+// further than that on a 1m chart. Anchors are clamped to this instead of failing.
+MAXBACK = 480
+
+// ─── Shade ────────────────────────────────────────────────────────────────────
+// The band between price and a level, filling the empty space to the right of the live
+// candle. It answers "how far is price from this ray" without reading the scale, and
+// because the near edge is `close` every bar it breathes as price moves -- the mirror
+// of VfvgX's boxes eroding as price fills them, except there is nothing to eat into
+// here, only the distance left to travel.
+//
+// Its length is deliberately NOT its own setting: it comes off the same per-timeframe
+// step the line and label already use, so Offset right and the staircase move all
+// three together and there is nothing to keep in sync by hand.
+gS = "Vequilibrium · Shade"
+shdOn    = input.bool(true, "Show shade", group = gS, tooltip = "Fills the gap between price and each level, right of the live candle, running exactly as long as that level's own line. Which timeframes get one is the grid below. Several at once overlap by design — they all start at price and fan out with the staircase — so switch rows off rather than reaching for the transparency when it gets busy.", display = display.none)
+shdSrc   = input.string("Line colour", "Shade colour", options = ["Line colour", "Custom"], group = gS, tooltip = "Line colour = the row's own colour from the Timeframes group, so a 4h shade matches the 4h ray and you can still tell them apart when several overlap. Custom = the one pair below for every row.", display = display.none)
+shdBull  = input.color(#b31217, "Custom shade — bull / bear", inline = 'sc', group = gS, display = display.none)
+shdBear  = input.color(#12b34d, "", inline = 'sc', group = gS, tooltip = "Only used when the colour mode above is Custom. Bull = the level left behind by an upward displacement (candle 1's high), bear = candle 1's low — the same pairing, and the same default hues, as the Timeframes rows.", display = display.none)
+shdTrans = input.int(88, "Shade transparency", minval = 0, maxval = 100, group = gS, tooltip = "0 = solid, 100 = invisible. Stamped over whatever the colour mode resolves to, so it REPLACES any transparency already carried by the line colour — this is the one place the shade's opacity is decided.", display = display.none)
+shdBd    = input.bool(false, "Shade border", inline = 'sb', group = gS, display = display.none)
+shdBdW   = input.int(1, "", minval = 1, maxval = 4, inline = 'sb', group = gS, display = display.none)
+shdBdSt  = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], inline = 'sb', group = gS, tooltip = "Outlines the shade in the row's own line colour, at full opacity rather than the fill's. Enable · thickness · style.", display = display.none)
+
+// Per-timeframe shade switches, kept apart from the line switches so you can run every
+// ray and shade only the two or three you are actually trading off. A row whose LINE is
+// off is never shaded whatever this says -- the shade needs a live level to measure to.
+// Defaults mirror the line defaults in the Timeframes group below, so switching the
+// feature on shades what the script was already drawing rather than nothing.
+SSTIP = "Which timeframes get a shade. Independent of the enable switches in the Timeframes group: a timeframe needs its line on to have a level at all, and needs this to have that level shaded."
+
+zT10S = input.bool(true,  "10s", inline = 'z1', group = gS, display = display.none)
+zT15S = input.bool(true,  "15s", inline = 'z1', group = gS, display = display.none)
+zT30S = input.bool(true,  "30s", inline = 'z1', group = gS, display = display.none)
+zT1   = input.bool(true,  "1m",  inline = 'z1', group = gS, display = display.none)
+zT2   = input.bool(false, "2m",  inline = 'z1', group = gS, tooltip = SSTIP, display = display.none)
+
+zT3   = input.bool(false, "3m",  inline = 'z2', group = gS, display = display.none)
+zT4   = input.bool(false, "4m",  inline = 'z2', group = gS, display = display.none)
+zT5   = input.bool(true,  "5m",  inline = 'z2', group = gS, display = display.none)
+zT6   = input.bool(false, "6m",  inline = 'z2', group = gS, display = display.none)
+zT10  = input.bool(true,  "10m", inline = 'z2', group = gS, tooltip = SSTIP, display = display.none)
+
+zT12  = input.bool(false, "12m", inline = 'z3', group = gS, display = display.none)
+zT15  = input.bool(true,  "15m", inline = 'z3', group = gS, display = display.none)
+zT20  = input.bool(false, "20m", inline = 'z3', group = gS, display = display.none)
+zT30  = input.bool(true,  "30m", inline = 'z3', group = gS, display = display.none)
+zT45  = input.bool(false, "45m", inline = 'z3', group = gS, tooltip = SSTIP, display = display.none)
+
+zT60  = input.bool(true,  "1h",  inline = 'z4', group = gS, display = display.none)
+zT120 = input.bool(true,  "2h",  inline = 'z4', group = gS, display = display.none)
+zT180 = input.bool(false, "3h",  inline = 'z4', group = gS, display = display.none)
+zT240 = input.bool(true,  "4h",  inline = 'z4', group = gS, display = display.none)
+zT360 = input.bool(false, "6h",  inline = 'z4', group = gS, tooltip = SSTIP, display = display.none)
+
+zT480 = input.bool(false, "8h",  inline = 'z5', group = gS, display = display.none)
+zT720 = input.bool(false, "12h", inline = 'z5', group = gS, display = display.none)
+zTD   = input.bool(true,  "1D",  inline = 'z5', group = gS, display = display.none)
+zTW   = input.bool(true,  "1W",  inline = 'z5', group = gS, display = display.none)
+zTM   = input.bool(false, "1M",  inline = 'z5', group = gS, tooltip = SSTIP, display = display.none)
+
+// ─── Timeframes ───────────────────────────────────────────────────────────────
+// Per row: on/off · bull colour (candle 1's high) · bear colour (candle 1's low) · style
+gT  = "Vequilibrium · Timeframes"
+TIP = "Enable · bull colour · bear colour · line style"
+
+eT10S = input.bool  (true,  "10s", group = gT, inline = "r10S", display = display.none)
+hT10S = input.color (#790c10, "",  group = gT, inline = "r10S", display = display.none)
+lT10S = input.color (#0c7934, "",  group = gT, inline = "r10S", display = display.none)
+sT10S = input.string("Solid", "",  group = gT, inline = "r10S", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT15S = input.bool  (true,  "15s", group = gT, inline = "r15S", display = display.none)
+hT15S = input.color (#8c0e12, "",  group = gT, inline = "r15S", display = display.none)
+lT15S = input.color (#0e8c3c, "",  group = gT, inline = "r15S", display = display.none)
+sT15S = input.string("Solid", "",  group = gT, inline = "r15S", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT30S = input.bool  (true,  "30s", group = gT, inline = "r30S", display = display.none)
+hT30S = input.color (#9f1015, "",  group = gT, inline = "r30S", display = display.none)
+lT30S = input.color (#109f44, "",  group = gT, inline = "r30S", display = display.none)
+sT30S = input.string("Solid", "",  group = gT, inline = "r30S", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT1   = input.bool  (true,  "1m",  group = gT, inline = "r1", display = display.none)
+hT1   = input.color (#b31217, "",  group = gT, inline = "r1", display = display.none)
+lT1   = input.color (#12b34d, "",  group = gT, inline = "r1", display = display.none)
+sT1   = input.string("Solid", "",  group = gT, inline = "r1", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT2   = input.bool  (false, "2m",  group = gT, inline = "r2", display = display.none)
+hT2   = input.color (#b81318, "",  group = gT, inline = "r2", display = display.none)
+lT2   = input.color (#13b84f, "",  group = gT, inline = "r2", display = display.none)
+sT2   = input.string("Solid", "",  group = gT, inline = "r2", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT3   = input.bool  (false, "3m",  group = gT, inline = "r3", display = display.none)
+hT3   = input.color (#bd1319, "",  group = gT, inline = "r3", display = display.none)
+lT3   = input.color (#13bd51, "",  group = gT, inline = "r3", display = display.none)
+sT3   = input.string("Solid", "",  group = gT, inline = "r3", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT4   = input.bool  (false, "4m",  group = gT, inline = "r4", display = display.none)
+hT4   = input.color (#c11419, "",  group = gT, inline = "r4", display = display.none)
+lT4   = input.color (#14c153, "",  group = gT, inline = "r4", display = display.none)
+sT4   = input.string("Solid", "",  group = gT, inline = "r4", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT5   = input.bool  (true,  "5m",  group = gT, inline = "r5", display = display.none)
+hT5   = input.color (#c6141a, "",  group = gT, inline = "r5", display = display.none)
+lT5   = input.color (#14c655, "",  group = gT, inline = "r5", display = display.none)
+sT5   = input.string("Solid", "",  group = gT, inline = "r5", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT6   = input.bool  (false, "6m",  group = gT, inline = "r6", display = display.none)
+hT6   = input.color (#d0151b, "",  group = gT, inline = "r6", display = display.none)
+lT6   = input.color (#15d059, "",  group = gT, inline = "r6", display = display.none)
+sT6   = input.string("Solid", "",  group = gT, inline = "r6", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT10  = input.bool  (true,  "10m", group = gT, inline = "r10", display = display.none)
+hT10  = input.color (#d9151c, "",  group = gT, inline = "r10", display = display.none)
+lT10  = input.color (#15d95d, "",  group = gT, inline = "r10", display = display.none)
+sT10  = input.string("Solid", "",  group = gT, inline = "r10", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT12  = input.bool  (false, "12m", group = gT, inline = "r12", display = display.none)
+hT12  = input.color (#e1181f, "",  group = gT, inline = "r12", display = display.none)
+lT12  = input.color (#18e162, "",  group = gT, inline = "r12", display = display.none)
+sT12  = input.string("Solid", "",  group = gT, inline = "r12", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT15  = input.bool  (true,  "15m", group = gT, inline = "r15", display = display.none)
+hT15  = input.color (#e91c22, "",  group = gT, inline = "r15", display = display.none)
+lT15  = input.color (#1ce967, "",  group = gT, inline = "r15", display = display.none)
+sT15  = input.string("Solid", "",  group = gT, inline = "r15", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT20  = input.bool  (false, "20m", group = gT, inline = "r20", display = display.none)
+hT20  = input.color (#ea262b, "",  group = gT, inline = "r20", display = display.none)
+lT20  = input.color (#26ea6e, "",  group = gT, inline = "r20", display = display.none)
+sT20  = input.string("Solid", "",  group = gT, inline = "r20", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT30  = input.bool  (true,  "30m", group = gT, inline = "r30", display = display.none)
+hT30  = input.color (#ea2f35, "",  group = gT, inline = "r30", display = display.none)
+lT30  = input.color (#2fea74, "",  group = gT, inline = "r30", display = display.none)
+sT30  = input.string("Solid", "",  group = gT, inline = "r30", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT45  = input.bool  (false, "45m", group = gT, inline = "r45", display = display.none)
+hT45  = input.color (#eb393f, "",  group = gT, inline = "r45", display = display.none)
+lT45  = input.color (#39eb7b, "",  group = gT, inline = "r45", display = display.none)
+sT45  = input.string("Solid", "",  group = gT, inline = "r45", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT60  = input.bool  (true,  "1h",  group = gT, inline = "r60", display = display.none)
+hT60  = input.color (#ec4248, "",  group = gT, inline = "r60", display = display.none)
+lT60  = input.color (#42ec81, "",  group = gT, inline = "r60", display = display.none)
+sT60  = input.string("Solid", "",  group = gT, inline = "r60", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT120 = input.bool  (true,  "2h",  group = gT, inline = "r120", display = display.none)
+hT120 = input.color (#ee565b, "",  group = gT, inline = "r120", display = display.none)
+lT120 = input.color (#56ee8e, "",  group = gT, inline = "r120", display = display.none)
+sT120 = input.string("Solid", "",  group = gT, inline = "r120", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT180 = input.bool  (false, "3h",  group = gT, inline = "r180", display = display.none)
+hT180 = input.color (#ef5f64, "",  group = gT, inline = "r180", display = display.none)
+lT180 = input.color (#5fef94, "",  group = gT, inline = "r180", display = display.none)
+sT180 = input.string("Solid", "",  group = gT, inline = "r180", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT240 = input.bool  (true,  "4h",  group = gT, inline = "r240", display = display.none)
+hT240 = input.color (#f0696d, "",  group = gT, inline = "r240", display = display.none)
+lT240 = input.color (#69f09b, "",  group = gT, inline = "r240", display = display.none)
+sT240 = input.string("Solid", "",  group = gT, inline = "r240", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT360 = input.bool  (false, "6h",  group = gT, inline = "r360", display = display.none)
+hT360 = input.color (#f06e72, "",  group = gT, inline = "r360", display = display.none)
+lT360 = input.color (#6ef09e, "",  group = gT, inline = "r360", display = display.none)
+sT360 = input.string("Solid", "",  group = gT, inline = "r360", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT480 = input.bool  (false, "8h",  group = gT, inline = "r480", display = display.none)
+hT480 = input.color (#f17376, "",  group = gT, inline = "r480", display = display.none)
+lT480 = input.color (#73f1a1, "",  group = gT, inline = "r480", display = display.none)
+sT480 = input.string("Solid", "",  group = gT, inline = "r480", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eT720 = input.bool  (false, "12h", group = gT, inline = "r720", display = display.none)
+hT720 = input.color (#f2777b, "",  group = gT, inline = "r720", display = display.none)
+lT720 = input.color (#77f2a4, "",  group = gT, inline = "r720", display = display.none)
+sT720 = input.string("Solid", "",  group = gT, inline = "r720", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eTD   = input.bool  (true,  "1D",  group = gT, inline = "rD", display = display.none)
+hTD   = input.color (#f27c80, "",  group = gT, inline = "rD", display = display.none)
+lTD   = input.color (#7cf2a7, "",  group = gT, inline = "rD", display = display.none)
+sTD   = input.string("Solid", "",  group = gT, inline = "rD", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eTW   = input.bool  (true,  "1W",  group = gT, inline = "rW", display = display.none)
+hTW   = input.color (#f49093, "",  group = gT, inline = "rW", display = display.none)
+lTW   = input.color (#90f4b4, "",  group = gT, inline = "rW", display = display.none)
+sTW   = input.string("Solid", "",  group = gT, inline = "rW", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+eTM   = input.bool  (false, "1M",  group = gT, inline = "rM", display = display.none)
+hTM   = input.color (#f6a4a6, "",  group = gT, inline = "rM", display = display.none)
+lTM   = input.color (#a4f6c0, "",  group = gT, inline = "rM", display = display.none)
+sTM   = input.string("Solid", "",  group = gT, inline = "rM", options = ["Solid", "Dashed", "Dotted"], tooltip = TIP, display = display.none)
+
+sty(string s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+// The shade's fill: the row's own line colour, or the custom pair, with the shade's own
+// transparency stamped over whatever the source colour was carrying. color.new REPLACES
+// transparency rather than compounding it, which is what makes the slider absolute --
+// the same 88 reads the same whether the row's line colour was opaque or not.
+shade_css(bool isb, color col) => color.new(shdSrc == "Custom" ? (isb ? shdBull : shdBear) : col, shdTrans)
+
+// ─── State ────────────────────────────────────────────────────────────────────
+// One slot = one direction on one timeframe. The level is the DISTAL edge of the
+// imbalance: candle 1's high on a bullish displacement, candle 1's low on a bearish
+// one. Candle 1 is the candle that JUST CLOSED -- the forming candle is the
+// displacement, so the edge being left behind is the last closed candle's extreme
+// tick. It arms only once price trades beyond it (the gap is being created) and dies
+// the moment price is back on the wrong side of it (swept -- the level has been
+// tested, so there is no imbalance left to mark). So a bear level is only ever on
+// the chart while price is below it, a bull level only while price is above it.
+type Lvl
+    line  ln   = na
+    label lb   = na
+    box   sh   = na     // price-to-level shade, na when this row is not shaded
+    float cand = na     // candle 1's high (bull) or low (bear) -- ONE close back
+    float lvl  = na     // armed level, na = nothing live
+    bool  used = false  // candidate already armed during this HTF candle
+    int   b0   = na     // chart bar where the CURRENT (forming) candle opened
+    int   b1   = na     // chart bar where candle 1 opened -- the level's source
+    int   anch = na     // source candle of the armed level = where its line starts
+
+// Returns true on the bar the level is filled.
+// The state machine runs whether or not the timeframe is displayed, so toggling one
+// back on restores the correct live level instead of waiting for the next close.
+// `off` is this timeframe's own step on the staircase, in bars past the live candle.
+// `shade` is this row's switch from the Shade group -- the shade colour is not passed
+// in, it is resolved in here from `col` and `isBull`, which the row already supplies.
+draw(Lvl s, float cand, bool changed, bool isBull, bool active, string tag, color col, string ls, int off, bool shade) =>
+    filled = false
+
+    // New HTF candle -> candle 1 of the pattern is now the one that just closed,
+    // and it started back at whatever bar the outgoing HTF candle opened on
+    if changed and not na(cand)
+        s.b1   := s.b0
+        s.b0   := bar_index
+        s.cand := cand
+        s.used := false
+
+    // Arm on displacement: price TRADES beyond the distal edge, leaving it behind.
+    // High/low rather than close, on purpose. The running extreme of the forming HTF
+    // candle is the same number whether you aggregate it out of 1m bars or read it
+    // straight off the native chart, so the level comes out identical on every chart
+    // timeframe. Judging it on the chart's close instead would let a 1m close count
+    // as a 30m displacement -- that is what made the 30m level jump between charts.
+    // `used` is the once-per-HTF-candle latch, so this fires on the first bar that
+    // breaks through and the running extreme needs no separate bookkeeping.
+    //
+    // The break has to CLEAR the contact band, not just the edge. Same threshold the
+    // death test below uses, so the two meet exactly: above it the level is live,
+    // inside it the level is gone. Without this a level would arm and die on the same
+    // tick whenever price stalled inside its own tolerance.
+    armed = false
+    if not na(s.cand) and not s.used and (isBull ? high > s.cand + tolPts : low < s.cand - tolPts)
+        s.lvl  := s.cand
+        s.anch := s.b1
+        s.used := true
+        armed  := true
+
+    // Death. The invariant this enforces, at every tick: a BEAR level is only on the
+    // chart while price is BELOW it, a BULL level only while price is ABOVE it. Price
+    // on the wrong side means the edge has been traded through -- it has been tested,
+    // so there is no imbalance left to mark and the line goes.
+    //
+    // "Back on the wrong side" means inside the contact band, not strictly through the
+    // edge -- price getting within tolerance of a level counts as reaching it.
+    //
+    // Three cases. The chart bar that ARMED the level is always special: it opened on
+    // the wrong side of the level and traded through, so its own low/high is from
+    // BEFORE the break and would kill the level on the tick after it armed. It is
+    // judged on the close instead -- breaking out and closing back inside on the very
+    // same bar is a failed displacement, so the level disarms, can arm again if price
+    // pushes back out, and raises no fill alert.
+    //
+    // Once the HTF candle that armed the level has closed, the level is real: the
+    // first TRADE back to it sweeps it for good, wick included, and that is what the
+    // alert fires on.
+    //
+    // In between -- level armed, its HTF candle still forming -- is what `tfKill`
+    // switches. Off: keep waiting for a chart close back inside, treated as a failed
+    // displacement. On: fall straight through to the wick test, so a 1m touch kills
+    // the 15m level without waiting for the 15m close. That is the stricter and more
+    // faithful reading of the method: the 15m gap only survives if the 15m candle's
+    // own low stays clear of the level, so any touch has already closed it. `used`
+    // stays latched on that path, so the level cannot re-arm inside an HTF candle
+    // whose own wick has already filled the gap.
+    if not na(s.lvl)
+        if armed
+            if (isBull ? close <= s.lvl + tolPts : close >= s.lvl - tolPts)
+                s.lvl  := na
+                s.used := false
+        else if s.used and not tfKill
+            if (isBull ? close <= s.lvl + tolPts : close >= s.lvl - tolPts)
+                s.lvl  := na
+                s.used := false
+        else if (isBull ? low <= s.lvl + tolPts : high >= s.lvl - tolPts)
+            filled := true
+            s.lvl  := na
+
+    // Render
+    if not active or na(s.lvl)
+        line.delete(s.ln)
+        label.delete(s.lb)
+        box.delete(s.sh)
+        s.ln := na
+        s.lb := na
+        s.sh := na
+    else
+        // Default: the line lives in the empty space to the RIGHT of the live candle,
+        // running out to its label. The other modes run back over the candles instead.
+        int xA   = bar_index
+        int xB   = bar_index + math.max(1, off)
+        if lineSpan != "Right of price"
+            // Start at the source candle, clamped to bar_index's reach and kept a bar
+            // back from price so the line is never zero-length or inverted.
+            int a  = na(s.anch) ? bar_index - 1 : s.anch
+            int lo = math.max(0, bar_index - MAXBACK)
+            int hi = math.max(0, bar_index - 1)
+            xA := a < lo ? lo : a > hi ? hi : a
+            xB := bar_index
+        int xLbl = bar_index + off + 1
+        if na(s.ln) or armed
+            line.delete(s.ln)
+            label.delete(s.lb)
+            // force_overlay welds the drawings to the price pane. Without it TradingView
+            // is free to hand the script its own pane, and a pane with no candles in it
+            // autoscales to the levels themselves -- they stop tracking price entirely.
+            s.ln := line.new(xA, s.lvl, xB, s.lvl, extend = extLeft ? extend.left : extend.none, color = col, width = lnWidth, style = ls, force_overlay = true)
+            s.lb := showLbls ? label.new(xLbl, s.lvl, tag, style = label.style_none, textcolor = lblMode == "Custom" ? lblCustom : col, size = lblSz, force_overlay = true) : na
+        else
+            // both ends walk with price; the clamp keeps x1 inside bar_index's reach
+            line.set_x1(s.ln, xA)
+            line.set_x2(s.ln, xB)
+            if not na(s.lb)
+                label.set_x(s.lb, xLbl)
+
+        // ── Shade ─────────────────────────────────────────────────────────────
+        // The band between price and the level. Its x run is bar_index out to
+        // bar_index + off -- the line's own span in "Right of price", off the same
+        // `off` the line and label use, so widening Offset right or the staircase
+        // step lengthens the shade with them. It is pinned right of price whatever
+        // `lineSpan` says: switching the line to run back over the candles moves the
+        // line only and leaves the shade where it is.
+        //
+        // Top and bottom come out of max/min rather than off `isBull`. The direction
+        // is already implied -- a bull level is only ever on the chart while price is
+        // ABOVE it, a bear level only while price is below -- so this is the right way
+        // up by construction, and it stays the right way up on the armed bar, where
+        // price has only just crossed and the invariant is one tick old.
+        //
+        // Updated in place rather than recreated: unlike the line it has no style that
+        // depends on the level, so there is nothing to rebuild when the level re-arms.
+        if shade and shdOn
+            int   xR  = bar_index + math.max(1, off)
+            float yHi = math.max(close, s.lvl)
+            float yLo = math.min(close, s.lvl)
+            if na(s.sh)
+                s.sh := box.new(bar_index, yHi, xR, yLo
+                  , border_color = shdBd ? col : na
+                  , border_width = shdBd ? shdBdW : 0
+                  , border_style = sty(shdBdSt)
+                  , bgcolor      = shade_css(isBull, col)
+                  , force_overlay = true)
+            else
+                box.set_lefttop(s.sh, bar_index, yHi)
+                box.set_rightbottom(s.sh, xR, yLo)
+        else if not na(s.sh)
+            // Row's shade switched off under a live level -- drop the box but leave
+            // the level alone, it is still a level.
+            box.delete(s.sh)
+            s.sh := na
+
+    // Gated by `active`: a row that is off is fed the chart's own timeframe by req()
+    // rather than its real one, so its state machine is running on data that means
+    // nothing. It draws nothing either way -- this keeps it out of the alerts too.
+    filled and active
+
+var Lvl uT10S = Lvl.new(), var Lvl dT10S = Lvl.new()
+var Lvl uT15S = Lvl.new(), var Lvl dT15S = Lvl.new()
+var Lvl uT30S = Lvl.new(), var Lvl dT30S = Lvl.new()
+var Lvl uT1   = Lvl.new(), var Lvl dT1   = Lvl.new()
+var Lvl uT2   = Lvl.new(), var Lvl dT2   = Lvl.new()
+var Lvl uT3   = Lvl.new(), var Lvl dT3   = Lvl.new()
+var Lvl uT4   = Lvl.new(), var Lvl dT4   = Lvl.new()
+var Lvl uT5   = Lvl.new(), var Lvl dT5   = Lvl.new()
+var Lvl uT6   = Lvl.new(), var Lvl dT6   = Lvl.new()
+var Lvl uT10  = Lvl.new(), var Lvl dT10  = Lvl.new()
+var Lvl uT12  = Lvl.new(), var Lvl dT12  = Lvl.new()
+var Lvl uT15  = Lvl.new(), var Lvl dT15  = Lvl.new()
+var Lvl uT20  = Lvl.new(), var Lvl dT20  = Lvl.new()
+var Lvl uT30  = Lvl.new(), var Lvl dT30  = Lvl.new()
+var Lvl uT45  = Lvl.new(), var Lvl dT45  = Lvl.new()
+var Lvl uT60  = Lvl.new(), var Lvl dT60  = Lvl.new()
+var Lvl uT120 = Lvl.new(), var Lvl dT120 = Lvl.new()
+var Lvl uT180 = Lvl.new(), var Lvl dT180 = Lvl.new()
+var Lvl uT240 = Lvl.new(), var Lvl dT240 = Lvl.new()
+var Lvl uT360 = Lvl.new(), var Lvl dT360 = Lvl.new()
+var Lvl uT480 = Lvl.new(), var Lvl dT480 = Lvl.new()
+var Lvl uT720 = Lvl.new(), var Lvl dT720 = Lvl.new()
+var Lvl uTD   = Lvl.new(), var Lvl dTD   = Lvl.new()
+var Lvl uTW   = Lvl.new(), var Lvl dTW   = Lvl.new()
+var Lvl uTM   = Lvl.new(), var Lvl dTM   = Lvl.new()
+
+// ─── Which rows are live ──────────────────────────────────────────────────────
+// Computed BEFORE the data requests, because the requests below use it: a row that
+// is off, or hidden for sitting under the chart timeframe, asks for the chart's own
+// timeframe instead of its real one. Its state machine then runs on chart data and
+// draws nothing, which costs no memory, where requesting 10s bars across a year of
+// history costs a great deal. Toggling a row forces a full recalculation, so the
+// substituted rows can never be seen.
+chartSec = timeframe.in_seconds()
+aT10S = eT10S and (not hideLower or timeframe.in_seconds("10S") >= chartSec)
+aT15S = eT15S and (not hideLower or timeframe.in_seconds("15S") >= chartSec)
+aT30S = eT30S and (not hideLower or timeframe.in_seconds("30S") >= chartSec)
+aT1   = eT1   and (not hideLower or timeframe.in_seconds("1")   >= chartSec)
+aT2   = eT2   and (not hideLower or timeframe.in_seconds("2")   >= chartSec)
+aT3   = eT3   and (not hideLower or timeframe.in_seconds("3")   >= chartSec)
+aT4   = eT4   and (not hideLower or timeframe.in_seconds("4")   >= chartSec)
+aT5   = eT5   and (not hideLower or timeframe.in_seconds("5")   >= chartSec)
+aT6   = eT6   and (not hideLower or timeframe.in_seconds("6")   >= chartSec)
+aT10  = eT10  and (not hideLower or timeframe.in_seconds("10")  >= chartSec)
+aT12  = eT12  and (not hideLower or timeframe.in_seconds("12")  >= chartSec)
+aT15  = eT15  and (not hideLower or timeframe.in_seconds("15")  >= chartSec)
+aT20  = eT20  and (not hideLower or timeframe.in_seconds("20")  >= chartSec)
+aT30  = eT30  and (not hideLower or timeframe.in_seconds("30")  >= chartSec)
+aT45  = eT45  and (not hideLower or timeframe.in_seconds("45")  >= chartSec)
+aT60  = eT60  and (not hideLower or timeframe.in_seconds("60")  >= chartSec)
+aT120 = eT120 and (not hideLower or timeframe.in_seconds("120") >= chartSec)
+aT180 = eT180 and (not hideLower or timeframe.in_seconds("180") >= chartSec)
+aT240 = eT240 and (not hideLower or timeframe.in_seconds("240") >= chartSec)
+aT360 = eT360 and (not hideLower or timeframe.in_seconds("360") >= chartSec)
+aT480 = eT480 and (not hideLower or timeframe.in_seconds("480") >= chartSec)
+aT720 = eT720 and (not hideLower or timeframe.in_seconds("720") >= chartSec)
+aTD   = eTD   and (not hideLower or timeframe.in_seconds("D")   >= chartSec)
+aTW   = eTW   and (not hideLower or timeframe.in_seconds("W")   >= chartSec)
+aTM   = eTM   and (not hideLower or timeframe.in_seconds("M")   >= chartSec)
+
+// Real timeframe when the row is live, chart timeframe when it is not.
+req(string tf, bool on) => on ? tf : timeframe.period
+
+// ─── Higher timeframe data (non-repainting: prior closed candle only) ─────────
+// lookahead_on + the [1] offset is the pair that makes this timeframe-agnostic.
+// [1] is always a CLOSED candle, so nothing leaks; lookahead_on is what stops the
+// value from depending on the chart you happen to be looking at. With lookahead_off
+// a historical chart bar is handed the candle BEFORE the one the native chart sees
+// -- so the same 30m level read one candle back on a 1m chart and repainted forward
+// by one candle the moment a bar went from realtime to historical.
+[pT10Sh, pT10Sl, pT10St] = request.security(syminfo.tickerid, req("10S", aT10S), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT15Sh, pT15Sl, pT15St] = request.security(syminfo.tickerid, req("15S", aT15S), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT30Sh, pT30Sl, pT30St] = request.security(syminfo.tickerid, req("30S", aT30S), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT1h,   pT1l,   pT1t  ] = request.security(syminfo.tickerid, req("1", aT1),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT2h,   pT2l,   pT2t  ] = request.security(syminfo.tickerid, req("2", aT2),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT3h,   pT3l,   pT3t  ] = request.security(syminfo.tickerid, req("3", aT3),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT4h,   pT4l,   pT4t  ] = request.security(syminfo.tickerid, req("4", aT4),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT5h,   pT5l,   pT5t  ] = request.security(syminfo.tickerid, req("5", aT5),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT6h,   pT6l,   pT6t  ] = request.security(syminfo.tickerid, req("6", aT6),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT10h,  pT10l,  pT10t ] = request.security(syminfo.tickerid, req("10", aT10),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT12h,  pT12l,  pT12t ] = request.security(syminfo.tickerid, req("12", aT12),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT15h,  pT15l,  pT15t ] = request.security(syminfo.tickerid, req("15", aT15),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT20h,  pT20l,  pT20t ] = request.security(syminfo.tickerid, req("20", aT20),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT30h,  pT30l,  pT30t ] = request.security(syminfo.tickerid, req("30", aT30),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT45h,  pT45l,  pT45t ] = request.security(syminfo.tickerid, req("45", aT45),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT60h,  pT60l,  pT60t ] = request.security(syminfo.tickerid, req("60", aT60),  [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT120h, pT120l, pT120t] = request.security(syminfo.tickerid, req("120", aT120), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT180h, pT180l, pT180t] = request.security(syminfo.tickerid, req("180", aT180), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT240h, pT240l, pT240t] = request.security(syminfo.tickerid, req("240", aT240), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT360h, pT360l, pT360t] = request.security(syminfo.tickerid, req("360", aT360), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT480h, pT480l, pT480t] = request.security(syminfo.tickerid, req("480", aT480), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pT720h, pT720l, pT720t] = request.security(syminfo.tickerid, req("720", aT720), [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pTDh,   pTDl,   pTDt  ] = request.security(syminfo.tickerid, req("D", aTD),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pTWh,   pTWl,   pTWt  ] = request.security(syminfo.tickerid, req("W", aTW),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+[pTMh,   pTMl,   pTMt  ] = request.security(syminfo.tickerid, req("M", aTM),   [high[1], low[1], time], lookahead = barmerge.lookahead_on)
+
+cT10S = not na(pT10St) and (na(pT10St[1]) or pT10St != pT10St[1])
+cT15S = not na(pT15St) and (na(pT15St[1]) or pT15St != pT15St[1])
+cT30S = not na(pT30St) and (na(pT30St[1]) or pT30St != pT30St[1])
+cT1   = not na(pT1t)   and (na(pT1t[1])   or pT1t   != pT1t[1])
+cT2   = not na(pT2t)   and (na(pT2t[1])   or pT2t   != pT2t[1])
+cT3   = not na(pT3t)   and (na(pT3t[1])   or pT3t   != pT3t[1])
+cT4   = not na(pT4t)   and (na(pT4t[1])   or pT4t   != pT4t[1])
+cT5   = not na(pT5t)   and (na(pT5t[1])   or pT5t   != pT5t[1])
+cT6   = not na(pT6t)   and (na(pT6t[1])   or pT6t   != pT6t[1])
+cT10  = not na(pT10t)  and (na(pT10t[1])  or pT10t  != pT10t[1])
+cT12  = not na(pT12t)  and (na(pT12t[1])  or pT12t  != pT12t[1])
+cT15  = not na(pT15t)  and (na(pT15t[1])  or pT15t  != pT15t[1])
+cT20  = not na(pT20t)  and (na(pT20t[1])  or pT20t  != pT20t[1])
+cT30  = not na(pT30t)  and (na(pT30t[1])  or pT30t  != pT30t[1])
+cT45  = not na(pT45t)  and (na(pT45t[1])  or pT45t  != pT45t[1])
+cT60  = not na(pT60t)  and (na(pT60t[1])  or pT60t  != pT60t[1])
+cT120 = not na(pT120t) and (na(pT120t[1]) or pT120t != pT120t[1])
+cT180 = not na(pT180t) and (na(pT180t[1]) or pT180t != pT180t[1])
+cT240 = not na(pT240t) and (na(pT240t[1]) or pT240t != pT240t[1])
+cT360 = not na(pT360t) and (na(pT360t[1]) or pT360t != pT360t[1])
+cT480 = not na(pT480t) and (na(pT480t[1]) or pT480t != pT480t[1])
+cT720 = not na(pT720t) and (na(pT720t[1]) or pT720t != pT720t[1])
+cTD   = not na(pTDt)   and (na(pTDt[1])   or pTDt   != pTDt[1])
+cTW   = not na(pTWt)   and (na(pTWt[1])   or pTWt   != pTWt[1])
+cTM   = not na(pTMt)   and (na(pTMt[1])   or pTMt   != pTMt[1])
+
+
+// ─── Staircase ────────────────────────────────────────────────────────────────
+// Each timeframe's rank = how many ACTIVE timeframes sit below it, so the ladder
+// closes up automatically when a row is switched off or hidden by "Hide timeframes
+// below chart TF". Rank 0 gets exactly "Offset right"; every step adds stairStep.
+rT10S = 0
+rT15S = rT10S + (aT10S ? 1 : 0)
+rT30S = rT15S + (aT15S ? 1 : 0)
+rT1   = rT30S + (aT30S ? 1 : 0)
+rT2   = rT1   + (aT1   ? 1 : 0)
+rT3   = rT2   + (aT2   ? 1 : 0)
+rT4   = rT3   + (aT3   ? 1 : 0)
+rT5   = rT4   + (aT4   ? 1 : 0)
+rT6   = rT5   + (aT5   ? 1 : 0)
+rT10  = rT6   + (aT6   ? 1 : 0)
+rT12  = rT10  + (aT10  ? 1 : 0)
+rT15  = rT12  + (aT12  ? 1 : 0)
+rT20  = rT15  + (aT15  ? 1 : 0)
+rT30  = rT20  + (aT20  ? 1 : 0)
+rT45  = rT30  + (aT30  ? 1 : 0)
+rT60  = rT45  + (aT45  ? 1 : 0)
+rT120 = rT60  + (aT60  ? 1 : 0)
+rT180 = rT120 + (aT120 ? 1 : 0)
+rT240 = rT180 + (aT180 ? 1 : 0)
+rT360 = rT240 + (aT240 ? 1 : 0)
+rT480 = rT360 + (aT360 ? 1 : 0)
+rT720 = rT480 + (aT480 ? 1 : 0)
+rTD   = rT720 + (aT720 ? 1 : 0)
+rTW   = rTD   + (aTD   ? 1 : 0)
+rTM   = rTW   + (aTW   ? 1 : 0)
+
+stepOf(int rank) => lblOffset + (stairOn ? rank * stairStep : 0)
+
+// ─── Draw ─────────────────────────────────────────────────────────────────────
+fuT10S = draw(uT10S, pT10Sh, cT10S, true,  aT10S, "10s", hT10S, sty(sT10S), stepOf(rT10S), zT10S)
+fdT10S = draw(dT10S, pT10Sl, cT10S, false, aT10S, "10s", lT10S, sty(sT10S), stepOf(rT10S), zT10S)
+fuT15S = draw(uT15S, pT15Sh, cT15S, true,  aT15S, "15s", hT15S, sty(sT15S), stepOf(rT15S), zT15S)
+fdT15S = draw(dT15S, pT15Sl, cT15S, false, aT15S, "15s", lT15S, sty(sT15S), stepOf(rT15S), zT15S)
+fuT30S = draw(uT30S, pT30Sh, cT30S, true,  aT30S, "30s", hT30S, sty(sT30S), stepOf(rT30S), zT30S)
+fdT30S = draw(dT30S, pT30Sl, cT30S, false, aT30S, "30s", lT30S, sty(sT30S), stepOf(rT30S), zT30S)
+fuT1   = draw(uT1,   pT1h,   cT1,   true,  aT1,   "1m",  hT1,   sty(sT1),   stepOf(rT1), zT1)
+fdT1   = draw(dT1,   pT1l,   cT1,   false, aT1,   "1m",  lT1,   sty(sT1),   stepOf(rT1), zT1)
+fuT2   = draw(uT2,   pT2h,   cT2,   true,  aT2,   "2m",  hT2,   sty(sT2),   stepOf(rT2), zT2)
+fdT2   = draw(dT2,   pT2l,   cT2,   false, aT2,   "2m",  lT2,   sty(sT2),   stepOf(rT2), zT2)
+fuT3   = draw(uT3,   pT3h,   cT3,   true,  aT3,   "3m",  hT3,   sty(sT3),   stepOf(rT3), zT3)
+fdT3   = draw(dT3,   pT3l,   cT3,   false, aT3,   "3m",  lT3,   sty(sT3),   stepOf(rT3), zT3)
+fuT4   = draw(uT4,   pT4h,   cT4,   true,  aT4,   "4m",  hT4,   sty(sT4),   stepOf(rT4), zT4)
+fdT4   = draw(dT4,   pT4l,   cT4,   false, aT4,   "4m",  lT4,   sty(sT4),   stepOf(rT4), zT4)
+fuT5   = draw(uT5,   pT5h,   cT5,   true,  aT5,   "5m",  hT5,   sty(sT5),   stepOf(rT5), zT5)
+fdT5   = draw(dT5,   pT5l,   cT5,   false, aT5,   "5m",  lT5,   sty(sT5),   stepOf(rT5), zT5)
+fuT6   = draw(uT6,   pT6h,   cT6,   true,  aT6,   "6m",  hT6,   sty(sT6),   stepOf(rT6), zT6)
+fdT6   = draw(dT6,   pT6l,   cT6,   false, aT6,   "6m",  lT6,   sty(sT6),   stepOf(rT6), zT6)
+fuT10  = draw(uT10,  pT10h,  cT10,  true,  aT10,  "10m", hT10,  sty(sT10),  stepOf(rT10), zT10)
+fdT10  = draw(dT10,  pT10l,  cT10,  false, aT10,  "10m", lT10,  sty(sT10),  stepOf(rT10), zT10)
+fuT12  = draw(uT12,  pT12h,  cT12,  true,  aT12,  "12m", hT12,  sty(sT12),  stepOf(rT12), zT12)
+fdT12  = draw(dT12,  pT12l,  cT12,  false, aT12,  "12m", lT12,  sty(sT12),  stepOf(rT12), zT12)
+fuT15  = draw(uT15,  pT15h,  cT15,  true,  aT15,  "15m", hT15,  sty(sT15),  stepOf(rT15), zT15)
+fdT15  = draw(dT15,  pT15l,  cT15,  false, aT15,  "15m", lT15,  sty(sT15),  stepOf(rT15), zT15)
+fuT20  = draw(uT20,  pT20h,  cT20,  true,  aT20,  "20m", hT20,  sty(sT20),  stepOf(rT20), zT20)
+fdT20  = draw(dT20,  pT20l,  cT20,  false, aT20,  "20m", lT20,  sty(sT20),  stepOf(rT20), zT20)
+fuT30  = draw(uT30,  pT30h,  cT30,  true,  aT30,  "30m", hT30,  sty(sT30),  stepOf(rT30), zT30)
+fdT30  = draw(dT30,  pT30l,  cT30,  false, aT30,  "30m", lT30,  sty(sT30),  stepOf(rT30), zT30)
+fuT45  = draw(uT45,  pT45h,  cT45,  true,  aT45,  "45m", hT45,  sty(sT45),  stepOf(rT45), zT45)
+fdT45  = draw(dT45,  pT45l,  cT45,  false, aT45,  "45m", lT45,  sty(sT45),  stepOf(rT45), zT45)
+fuT60  = draw(uT60,  pT60h,  cT60,  true,  aT60,  "1h",  hT60,  sty(sT60),  stepOf(rT60), zT60)
+fdT60  = draw(dT60,  pT60l,  cT60,  false, aT60,  "1h",  lT60,  sty(sT60),  stepOf(rT60), zT60)
+fuT120 = draw(uT120, pT120h, cT120, true,  aT120, "2h",  hT120, sty(sT120), stepOf(rT120), zT120)
+fdT120 = draw(dT120, pT120l, cT120, false, aT120, "2h",  lT120, sty(sT120), stepOf(rT120), zT120)
+fuT180 = draw(uT180, pT180h, cT180, true,  aT180, "3h",  hT180, sty(sT180), stepOf(rT180), zT180)
+fdT180 = draw(dT180, pT180l, cT180, false, aT180, "3h",  lT180, sty(sT180), stepOf(rT180), zT180)
+fuT240 = draw(uT240, pT240h, cT240, true,  aT240, "4h",  hT240, sty(sT240), stepOf(rT240), zT240)
+fdT240 = draw(dT240, pT240l, cT240, false, aT240, "4h",  lT240, sty(sT240), stepOf(rT240), zT240)
+fuT360 = draw(uT360, pT360h, cT360, true,  aT360, "6h",  hT360, sty(sT360), stepOf(rT360), zT360)
+fdT360 = draw(dT360, pT360l, cT360, false, aT360, "6h",  lT360, sty(sT360), stepOf(rT360), zT360)
+fuT480 = draw(uT480, pT480h, cT480, true,  aT480, "8h",  hT480, sty(sT480), stepOf(rT480), zT480)
+fdT480 = draw(dT480, pT480l, cT480, false, aT480, "8h",  lT480, sty(sT480), stepOf(rT480), zT480)
+fuT720 = draw(uT720, pT720h, cT720, true,  aT720, "12h", hT720, sty(sT720), stepOf(rT720), zT720)
+fdT720 = draw(dT720, pT720l, cT720, false, aT720, "12h", lT720, sty(sT720), stepOf(rT720), zT720)
+fuTD   = draw(uTD,   pTDh,   cTD,   true,  aTD,   "1D",  hTD,   sty(sTD),   stepOf(rTD), zTD)
+fdTD   = draw(dTD,   pTDl,   cTD,   false, aTD,   "1D",  lTD,   sty(sTD),   stepOf(rTD), zTD)
+fuTW   = draw(uTW,   pTWh,   cTW,   true,  aTW,   "1W",  hTW,   sty(sTW),   stepOf(rTW), zTW)
+fdTW   = draw(dTW,   pTWl,   cTW,   false, aTW,   "1W",  lTW,   sty(sTW),   stepOf(rTW), zTW)
+fuTM   = draw(uTM,   pTMh,   cTM,   true,  aTM,   "1M",  hTM,   sty(sTM),   stepOf(rTM), zTM)
+fdTM   = draw(dTM,   pTMl,   cTM,   false, aTM,   "1M",  lTM,   sty(sTM),   stepOf(rTM), zTM)
+
+// ─── Scale anchor ─────────────────────────────────────────────────────────────
+// Everything this script draws is a line/box/label, and drawing objects contribute
+// nothing to a pane's autoscale. With no scalable data TradingView is free to hand
+// the indicator its own price scale, which then fits itself to the drawings: the
+// levels stop tracking the candles and ride the viewport instead. A fully
+// transparent close keeps the script welded to the chart's own range. display.pane
+// keeps it out of the legend and price scale.
+plot(close, "", color = color.new(color.black, 100), display = display.pane, editable = false)
+
+//═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+//═══════════════════════════════════════════════════════════════════════════════
+fillBull = fuT10S or fuT15S or fuT30S or fuT1 or fuT2 or fuT3 or fuT4 or fuT5 or fuT6 or fuT10 or fuT12 or fuT15 or fuT20 or fuT30 or fuT45 or fuT60 or fuT120 or fuT180 or fuT240 or fuT360 or fuT480 or fuT720 or fuTD or fuTW or fuTM
+fillBear = fdT10S or fdT15S or fdT30S or fdT1 or fdT2 or fdT3 or fdT4 or fdT5 or fdT6 or fdT10 or fdT12 or fdT15 or fdT20 or fdT30 or fdT45 or fdT60 or fdT120 or fdT180 or fdT240 or fdT360 or fdT480 or fdT720 or fdTD or fdTW or fdTM
+
+alertcondition(fillBull, "Bullish imbalance filled", "Price retraced down into a higher-timeframe bullish distal edge")
+alertcondition(fillBear, "Bearish imbalance filled", "Price retraced up into a higher-timeframe bearish distal edge")
